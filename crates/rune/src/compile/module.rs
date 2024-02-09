@@ -14,6 +14,7 @@ use crate::{Hash, InstFnInfo, InstFnKind, InstFnName};
 use std::fmt;
 use std::future;
 use std::sync::Arc;
+use scylla::{QueryResult};
 
 /// Trait to handle the installation of auxilliary functions for a type
 /// installed into a module.
@@ -888,7 +889,7 @@ impl Module {
 
     /// Register an instance function.
     ///
-    /// # Examples
+    /// # Examples foo
     ///
     /// ```
     /// use std::sync::atomic::AtomicU32;
@@ -914,6 +915,18 @@ impl Module {
     /// # Ok(()) }
     /// ```
     pub fn async_inst_fn<N, Func, Args>(&mut self, name: N, f: Func) -> Result<(), ContextError>
+    where
+        N: InstFnName,
+        Func: AsyncInstFn<Args>,
+    {
+        let name = name.info();
+        let handler: Arc<FunctionHandler> = Arc::new(move |stack, args| f.fn_call(stack, args));
+        let ty = Func::ty();
+        let args = Some(Func::args());
+        self.assoc_fn(name, handler, ty, args, AssocKind::Instance)
+    }
+
+    pub fn async_inst_fn2<N, Func, Args>(&mut self, name: N, f: Func) -> Result<QueryResult, ContextError>
     where
         N: InstFnName,
         Func: AsyncInstFn<Args>,
@@ -1028,6 +1041,24 @@ pub trait AsyncInstFn<Args>: 'static + Send + Sync {
 
     /// Perform the vm call.
     fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<(), VmError>;
+}
+
+/// Trait used to provide the [async_inst_fn2][Module::async_inst_fn2] function.
+pub trait AsyncInstFn2<Args>: 'static + Send + Sync {
+    /// The type of the instance.
+    type Instance;
+    /// The return type of the function.
+    type Return;
+
+    /// Get the number of arguments.
+    fn args() -> usize;
+
+    /// Access static information on the instance type with the associated
+    /// function.
+    fn ty() -> AssocType;
+
+    /// Perform the vm call.
+    fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<QueryResult, VmError>;
 }
 
 macro_rules! impl_register {
@@ -1222,6 +1253,60 @@ macro_rules! impl_register {
 
                 impl_register!{@return stack, ret, Return}
                 Ok(())
+            }
+        }
+
+        impl<Func, Return, Instance, $($ty,)*> AsyncInstFn2<(Instance, $($ty,)*)> for Func
+        where
+            Func: 'static + Send + Sync + Fn(Instance $(, $ty)*) -> Return,
+            Return: 'static + future::Future,
+            Return::Output: ToValue,
+            Instance: UnsafeFromValue + TypeOf,
+            $($ty: UnsafeFromValue,)*
+        {
+            type Instance = Instance;
+            type Return = Return;
+
+            fn args() -> usize {
+                $count + 1
+            }
+
+            fn ty() -> AssocType {
+                AssocType {
+                    hash: Instance::type_hash(),
+                    type_info: Instance::type_info(),
+                }
+            }
+
+            fn fn_call(&self, stack: &mut Stack, args: usize) -> Result<QueryResult, VmError> {
+                impl_register!{@check-args ($count + 1), args}
+
+                #[allow(unused_mut)]
+                let mut it = stack.drain($count + 1)?;
+                let inst = it.next().unwrap();
+                $(let $var = it.next().unwrap();)*
+                drop(it);
+
+                // Safety: Future is owned and will only be called within the
+                // context of the virtual machine, which will provide
+                // exclusive thread-local access to itself while the future is
+                // being polled.
+                #[allow(unused)]
+                let ret = unsafe {
+                    impl_register!{@unsafe-inst-vars inst, $count, $($ty, $var, $num,)*}
+
+                    let fut = self(Instance::unsafe_coerce(inst.0), $(<$ty>::unsafe_coerce($var.0),)*);
+
+                    Future::new(async move {
+                        let output = fut.await;
+                        impl_register!{@drop-stack-guards inst, $($var),*}
+                        let value = output.to_value()?;
+                        Ok(value)
+                    })
+                };
+
+                impl_register!{@return stack, ret, Return}
+                Ok(ret)
             }
         }
     };
